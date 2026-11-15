@@ -5,7 +5,9 @@ import CryptoKit
 public struct DeviceSession: Codable, Equatable, Sendable {
     public let environmentToken: String
     public let deviceToken: String
-    /// Paylaşılan sır. Keychain'de yaşar, asla loglanmaz.
+    /// Paylaşılan sır; asla loglanmaz. Varsayılan depo (`UserDefaultsConsentStorage`)
+    /// onu UserDefaults'ta tutar — Keychain isteyen uygulama kendi
+    /// `ConsentStorage` uygulamasını verir.
     public let secret: String
     public let expiresAt: Date
 

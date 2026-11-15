@@ -59,11 +59,27 @@ public struct PreferencesResponse: Decodable, Equatable, Sendable {
     public let bannerSettings: [String: AnyCodable]?
     public let categories: [ConsentCategoryInfo]
     public let platform: String?
+    /// Sunucuda bu `session_id` için kayıtlı son karar (`consents` alanının
+    /// aynısı). Kayıt yoksa ya da biçim tanınmazsa nil.
+    public let currentConsents: [String: Bool]?
 
     private enum CodingKeys: String, CodingKey {
         case status, categories, platform
         case environmentName = "environment_name"
         case bannerSettings = "banner_settings"
+        case currentConsents = "current_consents"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        status = try c.decode(Bool.self, forKey: .status)
+        categories = try c.decode([ConsentCategoryInfo].self, forKey: .categories)
+        environmentName = try? c.decodeIfPresent(String.self, forKey: .environmentName)
+        platform = try? c.decodeIfPresent(String.self, forKey: .platform)
+        // İki alan da serbest şekilli: boş PHP dizisi JSON'da `[]` olarak gelir
+        // ve sözlük beklerken bütün yanıtın çözülmesini düşürürdü.
+        bannerSettings = try? c.decodeIfPresent([String: AnyCodable].self, forKey: .bannerSettings)
+        currentConsents = try? c.decodeIfPresent([String: Bool].self, forKey: .currentConsents)
     }
 }
 
@@ -103,22 +119,32 @@ struct HandshakeResponse: Decodable {
 ///   GET  /api/preferences/{token}  → kategori beyanı (?platform=mobile)
 ///   POST /api/v/{token}/c          → rıza kaydı (imzalı)
 public actor VeribenimAPI {
+    /// Sunucu `app_version` / `os_version` için `max:32` doğrular; daha uzun
+    /// bir değer el sıkışmayı 422 ile düşürür ve rıza kanalı hiç açılmaz.
+    static let versionMaxLength = 32
+
     private let baseURL: URL
     private let transport: Transport
     private let decoder: JSONDecoder
+    private let userAgent: String
 
-    public init(baseURL: URL, transport: Transport = URLSessionTransport()) {
+    public init(
+        baseURL: URL,
+        transport: Transport = URLSessionTransport(),
+        userAgent: String = VeribenimConfig.defaultUserAgent(platform: "ios")
+    ) {
         self.baseURL = baseURL
         self.transport = transport
         self.decoder = JSONDecoder()
+        self.userAgent = userAgent
     }
 
     // MARK: - El sıkışma
 
     public func handshake(appIdentifier: String, platform: String, appVersion: String?, osVersion: String?) async throws -> DeviceSession {
         var body: [String: String] = ["app_identifier": appIdentifier, "platform": platform]
-        body["app_version"] = appVersion
-        body["os_version"] = osVersion
+        body["app_version"] = appVersion.map { String($0.prefix(Self.versionMaxLength)) }
+        body["os_version"] = osVersion.map { String($0.prefix(Self.versionMaxLength)) }
 
         var request = URLRequest(url: baseURL.appendingPathComponent("api/app/session"))
         request.httpMethod = "POST"
@@ -174,11 +200,19 @@ public actor VeribenimAPI {
 
     @discardableResult
     public func logConsent(session: DeviceSession, entry: QueuedConsent) async throws -> Bool {
+        // Gövde alanları `ConsentController::log` doğrulamasıyla birebir.
+        //
+        // `platform` GÖNDERİLMEZ: sunucu damgayı gövdeden değil imzalı cihaz
+        // oturumundan okur (`ConsentPlatform::stampFor`).
+        //
+        // `user_agent` ZORUNLU sayılmalı: sunucu bot tespitini gövdedeki bu
+        // alanla yapar ve boş değeri doğrudan bot sayar (`BotDetector`:
+        // empty_ua). Gönderilmeseydi her mobil rıza raporlardan düşerdi.
         let payload: [String: Any] = [
             "action": entry.action.rawValue,
             "consents": entry.preferences.payload,
             "session_id": entry.sessionId,
-            "platform": "mobile",
+            "user_agent": userAgent,
         ]
 
         let body = try JSONSerialization.data(withJSONObject: payload)
@@ -199,9 +233,9 @@ public actor VeribenimAPI {
 
         let (_, http) = try await transport.send(request)
 
-        // 403 → cihaz oturumu geçersiz veya modül kapandı. Çağıran yeniden
-        // el sıkışır; kuyruktaki kayıt korunur.
-        guard http.statusCode == 200 else { throw VeribenimError.http(status: http.statusCode) }
+        // Hata sınıflandırması çağıranda (`Veribenim.flush`): 403 yeniden el
+        // sıkışma, 400/422 kalıcı ret, geri kalanı yeniden denenir.
+        guard (200..<300).contains(http.statusCode) else { throw VeribenimError.http(status: http.statusCode) }
         return true
     }
 }
